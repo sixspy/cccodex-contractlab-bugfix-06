@@ -52,9 +52,9 @@ createApp({
     const token=ref(localStorage.getItem('contractlab_token')||'');
     const user=ref(localStorage.getItem('contractlab_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
-    const contracts=ref([]), batches=ref([]), buffers=ref([]), recon=ref({});
+    const contracts=ref([]), batches=ref([]), buffers=ref([]), missing=ref([]), recon=ref({}), strategy=ref({}), review=ref({});
     const form=ref({subject:'订单入站', payload_fields:'order_id,amount'});
-    const nav=['契约版本','入站校验','双写缓冲','契约对账'];
+    const nav=['契约版本','入站校验','双写缓冲','契约对账','调策略附页','复核卡片'];
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
     async function login(){
       err.value='';
@@ -79,8 +79,20 @@ createApp({
       batches.value=Array.isArray(b.items)?b.items:[];
       const u=await loadJson('/api/buffers'); if(u===null) return;
       buffers.value=Array.isArray(u.items)?u.items:[];
+      missing.value=Array.isArray(u.missing_items)?u.missing_items:[];
       const q=await loadJson('/api/reconcile'); if(q===null) return;
       recon.value=q&&typeof q==='object'?q:{};
+      const st=await loadJson('/api/strategy'); if(st===null) return;
+      strategy.value=st||{};
+      const rv=await loadJson('/api/review'); if(rv===null) return;
+      review.value=rv||{};
+    }
+    async function supplement(batchId){
+      actionErr.value='';
+      const r=await fetch('/api/buffers/supplement',{method:'POST',headers:auth(),body:JSON.stringify({batch_id:batchId})});
+      const j=await r.json().catch(()=>({}));
+      actionErr.value=r.ok?(j.contended?'后到补行：已记缓冲争用':'补行完成：已记缓冲补行'):(j.detail||'补行失败');
+      await refresh();
     }
     async function validate(){
       actionErr.value='';
@@ -88,8 +100,9 @@ createApp({
       const j=await r.json(); actionErr.value=r.ok?('校验结果：'+j.result+(j.missing?('；缺 '+j.missing.join(',')):'')):(j.detail||'失败');
       await refresh();
     }
+    function verdictClass(v){return v==='假缓冲'?'stamp bad':'stamp';}
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,recon,form,actionErr,login,logout,validate};
+    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,missing,recon,strategy,review,form,actionErr,login,logout,validate,supplement,verdictClass};
   },
   template:`
   <div v-if="!token" class="login">
@@ -124,6 +137,7 @@ createApp({
       </div>
       <div class="card">
         <h2>最近批次</h2>
+        <p>口径 {{batches.path||'甲'}} · 判定 <span :class="verdictClass(recon.verdict)">{{recon.verdict}}</span> · 假缓冲批次 {{(recon.fake_buffer_batches||[]).join(',')||'无'}}</p>
         <table><thead><tr><th>批次</th><th>结果</th><th>说明</th></tr></thead>
         <tbody><tr v-for="b in (batches||[]).slice(0,8)" :key="b.id">
           <td>#{{b.id}} {{b.subject}}</td>
@@ -134,12 +148,35 @@ createApp({
     </div>
     <div class="card" v-show="tab===2">
       <h2>双写缓冲</h2>
+      <p>口径 {{recon.path||'甲'}} · <span :class="verdictClass(recon.verdict)">{{recon.verdict}}</span> · 缓冲 {{recon.buffered}} · 缓冲行 {{recon.buffer_rows}}</p>
       <table><thead><tr><th>缓冲</th><th>批次</th><th>主题</th><th>原因</th></tr></thead>
       <tbody><tr v-for="b in buffers" :key="b.id"><td>{{b.id}}</td><td>{{b.batch_id}}</td><td>{{b.subject}}</td><td>{{b.reason}}</td></tr></tbody></table>
+      <div v-if="missing.length" style="margin-top:12px">
+        <h2>标缓冲无行（假缓冲）</h2>
+        <table><thead><tr><th>批次</th><th>说明</th><th>操作</th></tr></thead>
+        <tbody><tr v-for="m in missing" :key="m.batch_id"><td>#{{m.batch_id}} {{m.subject}}</td><td>{{m.detail}}</td>
+          <td><button class="ghost" @click="supplement(m.batch_id)">补行</button></td></tr></tbody></table>
+      </div>
+      <div class="err">{{actionErr}}</div>
     </div>
     <div class="card" v-show="tab===3">
       <h2>契约对账摘要</h2>
-      <p>入站 {{recon.ingress_total}} · 通过 {{recon.passed}} · 缓冲 {{recon.buffered}} · 拒收 {{recon.rejected}} · 缓冲行 {{recon.buffer_rows}} · 对齐 {{recon.aligned}}</p>
+      <p>入站 {{recon.ingress_total}} · 通过 {{recon.passed}} · 缓冲 {{recon.buffered}} · 拒收 {{recon.rejected}} · 缓冲行 {{recon.buffer_rows}} · 计缓冲 {{recon.counted_buffers}} · 对齐 {{recon.aligned}}</p>
+      <p>判定 <span :class="verdictClass(recon.verdict)">{{recon.verdict}}</span>
+        <span v-if="recon.fake_buffer_batches&&recon.fake_buffer_batches.length"> · 假缓冲批次 {{recon.fake_buffer_batches.join(',')}}</span></p>
+    </div>
+    <div class="card" v-show="tab===4">
+      <h2>调策略附页</h2>
+      <p>修复径 <b>{{strategy.path||'甲'}}</b> · 判定 <span :class="verdictClass(strategy.verdict)">{{strategy.verdict}}</span></p>
+      <p class="meta">{{strategy.policy_note}}</p>
+      <p>已选定 {{strategy.policy&&strategy.policy.decided_on}}，当天不许换径。</p>
+      <table><thead><tr><th>事件</th><th>批次</th><th>操作人</th><th>说明</th></tr></thead>
+      <tbody><tr v-for="e in (strategy.events||[])" :key="e.id"><td>{{e.kind}}</td><td>{{e.batch_id||'-'}}</td><td>{{e.actor}}</td><td>{{e.detail}}</td></tr></tbody></table>
+    </div>
+    <div class="card" v-show="tab===5">
+      <h2>复核卡片</h2>
+      <p>{{review.card&&review.card.title}} · 判定 <span :class="verdictClass(review.verdict)">{{review.verdict}}</span> · 计缓冲 {{review.card&&review.card.counted_buffers}}</p>
+      <p class="meta">列表、队列、账册、附页、卡片同绿同空；任一处标缓冲无行即同转假缓冲。</p>
     </div>
   </div>`
 }).mount('#app');
